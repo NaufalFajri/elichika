@@ -164,6 +164,15 @@ def python_checks(astcenc="/probe/libastcenc.so", temporary="/tmp"):
     from PIL import Image, ImageFont, ImageDraw
     import adminui.server
     import webtools.server
+    from importlib.resources import files
+
+    # Read through the packaged importer: this must work inside Chaquopy's
+    # APK asset ZIP as well as the extracted 4/16 KB kernel probe payload.
+    preview = files("webtools.core").joinpath("resources/sifas_suit_preview.unity").read_bytes()
+    assert len(preview) == 8826
+    assert hashlib.sha256(preview).hexdigest() == "96ada81d0b8f35573fa81e0a3830b018a1d46ff26fff778f3be0a0deed618ebe"
+    preview_clips = [obj.read().m_Name for obj in UnityPy.load(preview).objects if obj.type.name == "AnimationClip"]
+    assert preview_clips == ["ch0301_GEN_preview1_L"]
 
     assert sys.version_info[:2] == (3, 13)
     assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 0
@@ -234,6 +243,7 @@ def python_checks(astcenc="/probe/libastcenc.so", temporary="/tmp"):
             "beginner_mesh_percentages": True,
             "gallery_thumbnail_png": True, "gallery_png_sha256": gallery_sha256,
             "adminui_and_webtools_imports": True, "astc_encode_decode": True,
+            "bundled_suit_preview": True,
             "astc_sha256": hashlib.sha256(astc_data).hexdigest(), "astc_mean_error": round(float(difference), 3)}
 
 
