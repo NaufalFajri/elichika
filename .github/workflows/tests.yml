@@ -130,6 +130,8 @@ jobs:
           done
           curl --fail --silent "$VIEWER_URL/api/tools" > /dev/null
           node tests/viewer_rig_browser.js
+          node tests/viewer_layout_browser.js
+          node tests/viewer_compensation_browser.js
           node tests/sifas_material_browser.js
           node tests/viewer_quality_browser.js
 
