@@ -37,6 +37,7 @@ class ModelViewerRigTest {
         assertTrue("Supported saved file settings must be applied on load", defaultSavedNodes.getBoolean("enabled"))
         assertEquals("Scale, position and rotation records must all apply", 3, defaultSavedNodes.getInt("applied"))
         assertSavedTransforms(state(webView))
+        val referenceControls = assertReferenceOnlyControls(webView)
         run(webView, "document.getElementById('viewer-node-editor').open=true;ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('BreastSize'),'change');")
         assertAdvancedVector(webView, "scale", doubleArrayOf(130.0, 90.0, 100.0))
         run(webView, "ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('Tip'),'change');")
@@ -75,7 +76,7 @@ class ModelViewerRigTest {
         assertEquals(4, rest.getJSONObject("probe").getInt("sourceTriangles"))
         assertEquals(4, rest.getJSONObject("probe").getInt("triangles"))
         val restVertices = evaluate(webView, "return JSON.stringify(ViewerRigQa.deformedVertices());")
-        assertEquals("The genuine Unity skin retains three weighted and two compensation joints", 5, restVertices.getInt("jointCount"))
+        assertEquals("The genuine Unity skin retains three weighted and two unweighted source joints", 5, restVertices.getInt("jointCount"))
         val authored = arrayOf(doubleArrayOf(.4, 0.0, 0.0), doubleArrayOf(-.4, 0.0, 0.0),
             doubleArrayOf(.4, .65, 0.0), doubleArrayOf(-.4, .65, 0.0),
             doubleArrayOf(.25, 1.25, 0.0), doubleArrayOf(-.25, 1.25, 0.0))
@@ -102,33 +103,56 @@ class ModelViewerRigTest {
         click(webView, "viewer-node-reset")
         boneInput(webView, "Head", "rotation", "Z", 45)
         boneInput(webView, "Neck_Hair", "rotation", "X", 30)
-        val headBeforeHeight = nodeWorld(webView, "Head")
-        val hairBeforeHeight = nodeWorld(webView, "Neck_Hair")
-        assertTrue("Use a genuinely rotated head to reject local-axis inverse scaling",
-            kotlin.math.abs(headBeforeHeight.getJSONArray("linear").getDouble(1)) > .5)
-        input(webView, "viewer-height", "120")
-        assertBoneScale(state(webView), "Move", doubleArrayOf(1.0, 1.2, 1.0))
-        val headAfterHeight = nodeWorld(webView, "Head")
-        val hairAfterHeight = nodeWorld(webView, "Neck_Hair")
-        assertArrayNear("Height must preserve the rotated head's complete world basis",
-            headBeforeHeight.getJSONArray("linear"), headAfterHeight.getJSONArray("linear"))
-        assertArrayNear("Height must preserve the back-hair world basis",
-            hairBeforeHeight.getJSONArray("linear"), hairAfterHeight.getJSONArray("linear"))
-        assertTrue("Height must move the actual head anchor vertically",
-            headAfterHeight.getJSONArray("position").getDouble(1) > headBeforeHeight.getJSONArray("position").getDouble(1))
+        val profileInvariant = mapOf("Move" to nodeWorld(webView, "Move"), "Head" to nodeWorld(webView, "Head"),
+            "Neck_Hair" to nodeWorld(webView, "Neck_Hair"))
+        assertTrue("Use a genuinely rotated head when checking profile isolation",
+            kotlin.math.abs(profileInvariant.getValue("Head").getJSONArray("linear").getDouble(1)) > .5)
+        val sourceProfiles = listOf(
+            "stock" to doubleArrayOf(1.0, 1.0, 1.0),
+            "yoshiko_shioriko" to doubleArrayOf(.95, .99, .98), "honoka_maki" to doubleArrayOf(.90, .98, .96),
+            "umi_ruby_kasumi" to doubleArrayOf(.80, .96, .92), "rin" to doubleArrayOf(.72, .95, .90),
+            "nico" to doubleArrayOf(.64, .94, .88), "rina" to doubleArrayOf(.61, .91, .85),
+            "chika_you_ayumu" to doubleArrayOf(1.04, 1.02, 1.04), "hanayo_setsuna" to doubleArrayOf(1.08, 1.04, 1.08),
+            "hanamaru_ai" to doubleArrayOf(1.12, 1.06, 1.12), "lanzhu" to doubleArrayOf(1.14, 1.07, 1.14),
+            "eli_kanan_kanata" to doubleArrayOf(1.16, 1.08, 1.16), "mari" to doubleArrayOf(1.20, 1.10, 1.20),
+            "karin" to doubleArrayOf(1.22, 1.11, 1.22), "nozomi" to doubleArrayOf(1.30, 1.15, 1.30),
+            "emma" to doubleArrayOf(1.30, 1.18, 1.30))
+        val profileResults = JSONArray()
+        for ((profile, expected) in sourceProfiles) {
+            input(webView, "viewer-breast-preset", profile, "change")
+            input(webView, "viewer-breast-preset", profile, "change")
+            val current = state(webView)
+            assertBoneScale(current, "BreastSize", expected)
+            assertFalse("An exact selected reference must not be labelled custom",
+                current.getJSONObject("rig").getJSONObject("breastProfile").getBoolean("custom"))
+            for ((name, before) in profileInvariant) assertArrayNear("$profile must leave the full authored $name world matrix unchanged",
+                before.getJSONArray("matrix"), nodeWorld(webView, name).getJSONArray("matrix"))
+            profileResults.put(JSONObject().put("id", profile).put("scale", bone(current, "BreastSize").getJSONArray("scale")))
+        }
+        val breast = capture(webView, compare = "rest")
+        assertChanged("An exact reference must change actual weighted ribbon pixels", breast)
+        boneInput(webView, "BreastSize", "position", "X", .02)
+        boneInput(webView, "BreastSize", "rotation", "Z", 15)
+        boneInput(webView, "BreastSize", "scale", "X", 140)
+        val manualProfile = state(webView)
+        assertTrue("A manual scale must be shown as a custom shape",
+            manualProfile.getJSONObject("rig").getJSONObject("breastProfile").getBoolean("custom"))
+        input(webView, "viewer-breast-preset", "rina", "change")
+        val selectedProfile = state(webView)
+        assertBoneScale(selectedProfile, "BreastSize", doubleArrayOf(.61, .91, .85))
+        for (kind in listOf("position", "quaternion")) assertArrayNear("A reference clears only manual scale, preserving breast $kind",
+            bone(manualProfile, "BreastSize").getJSONArray(kind), bone(selectedProfile, "BreastSize").getJSONArray(kind))
+        click(webView, "viewer-breast-reset")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.0, 1.0, 1.0))
+        for (kind in listOf("position", "quaternion")) assertArrayNear("Loaded-shape reset preserves manual breast $kind",
+            bone(manualProfile, "BreastSize").getJSONArray(kind), bone(state(webView), "BreastSize").getJSONArray(kind))
         click(webView, "viewer-node-reset")
         run(webView, "ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('Head'),'change');")
         click(webView, "viewer-node-reset")
-        val height = capture(webView, compare = "rest")
-        assertChanged("Height must change actual skinned pixels", height)
-        input(webView, "viewer-breast", "150")
-        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.5, 1.25, 1.5))
-        val breast = capture(webView, compare = "rest")
-        assertChanged("BreastSize must change the weighted neutral ribbon", breast)
-        input(webView, "viewer-breast", "150")
-        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.5, 1.25, 1.5))
+        run(webView, "ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('Neck_Hair'),'change');")
+        click(webView, "viewer-node-reset")
         resetAuthoredBaseline()
-        assertRestored("Reset must remove live scaling without compounding", capture(webView, compare = "rest"))
+        assertRestored("Reset must restore the source rather than compound reference settings", capture(webView, compare = "rest"))
 
         val savedAvailable = state(webView).getJSONObject("rig").getJSONObject("savedNodes")
         assertTrue("The real serialized component must supply a supported saved entry", savedAvailable.getBoolean("available"))
@@ -143,9 +167,20 @@ class ModelViewerRigTest {
         click(webView, "viewer-saved-nodes")
         assertRestored("Disabling saved entries must restore authored geometry", capture(webView, compare = "rest"))
         click(webView, "viewer-saved-nodes")
-        input(webView, "viewer-breast", "150")
-        input(webView, "viewer-breast", "150")
-        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.95, .9 * (1.475 / 1.15), 1.5))
+        input(webView, "viewer-breast-preset", "emma", "change")
+        input(webView, "viewer-breast-preset", "emma", "change")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.3, 1.18, 1.3))
+        click(webView, "viewer-saved-nodes")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.3, 1.18, 1.3))
+        click(webView, "viewer-saved-nodes")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.3, 1.18, 1.3))
+        click(webView, "viewer-breast-reset")
+        assertSavedTransforms(state(webView))
+        input(webView, "viewer-breast-preset", "stock", "change")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.0, 1.0, 1.0))
+        click(webView, "viewer-breast-reset")
+        assertSavedTransforms(state(webView))
+        assertRestored("Loaded is distinct from Stock and must restore the exact custom file pixels", capture(webView, compare = "savedDefault"))
         resetAuthoredBaseline()
         assertFalse(state(webView).getJSONObject("rig").getJSONObject("savedNodes").getBoolean("enabled"))
         assertRestored("Reset must also remove explicitly applied saved settings", capture(webView, compare = "rest"))
@@ -197,8 +232,7 @@ class ModelViewerRigTest {
         input(webView, "viewer-motion", "Neutral swing", "change")
         input(webView, "viewer-time", ".6")
         click(webView, "viewer-saved-nodes")
-        input(webView, "viewer-height", "115")
-        input(webView, "viewer-breast", "130")
+        input(webView, "viewer-breast-preset", "rin", "change")
         input(webView, "viewer-expression-value", "40")
         boneInput(webView, "Tip", "rotation", "X", 20)
         boneInput(webView, "Head", "rotation", "Z", 35)
@@ -220,7 +254,7 @@ class ModelViewerRigTest {
         assertRestored("Returning to the viewer must retain its actual adjusted image", afterTab)
         recoverContext(webView)
         assertRetained(retainedState, state(webView))
-        assertArrayNear("Context recovery must retain the compensated rotated head world matrix",
+        assertArrayNear("Context recovery must retain the authored rotated head world matrix",
             retainedHeadWorld.getJSONArray("matrix"), nodeWorld(webView, "Head").getJSONArray("matrix"))
         val afterContext = capture(webView, compare = highQualityReference)
         assertRestored("A restored native WebGL context must retain the adjusted model", afterContext)
@@ -242,10 +276,10 @@ class ModelViewerRigTest {
             .put("defaultSavedNodes", defaultSavedNodes).put("defaultSavedFrame", defaultSavedFrame)
             .put("restoredFileDefault", restoredFileDefault)
             .put("restVertices", restVertices).put("rest", rest).put("manualPose", manualPose)
-            .put("heightHeadBefore", headBeforeHeight).put("heightHeadAfter", headAfterHeight)
-            .put("heightHairBefore", hairBeforeHeight).put("heightHairAfter", hairAfterHeight)
+            .put("referenceOnlyControls", referenceControls).put("absoluteProfiles", profileResults)
+            .put("profileInvariantHead", profileInvariant.getValue("Head")).put("profileInvariantHair", profileInvariant.getValue("Neck_Hair"))
             .put("multiAxisHeadQuaternion", multiAxisHead)
-            .put("height", height).put("breast", breast).put("savedEntry", saved).put("expression", expression)
+            .put("breast", breast).put("savedEntry", saved).put("expression", expression)
             .put("scrub", scrub).put("playing", playing).put("paused", paused)
             .put("highQuality3D", quality)
             .put("afterTab", afterTab).put("afterContext", afterContext)
@@ -367,12 +401,12 @@ class ModelViewerRigTest {
     private fun recoverContext(webView: WebView) {
         run(webView, "ViewerRigQa.loseContext();")
         waitForDom(webView, "actual native context loss", 30) {
-            "var s=ModelViewer.getState();return JSON.stringify({ok:s.contextLost&&document.getElementById('viewer-height').disabled&&" +
+            "var s=ModelViewer.getState();return JSON.stringify({ok:s.contextLost&&document.getElementById('viewer-breast-preset').disabled&&" +
                 "document.getElementById('viewer-pose-basic').disabled&&document.getElementById('viewer-pose-preview').disabled,state:s});"
         }
         run(webView, "ViewerRigQa.restoreContext();")
         waitForDom(webView, "actual native context restoration", 60) {
-            "var s=ModelViewer.getState();return JSON.stringify({ok:!s.contextLost&&s.loaded&&!s.loading&&!document.getElementById('viewer-height').disabled&&" +
+            "var s=ModelViewer.getState();return JSON.stringify({ok:!s.contextLost&&s.loaded&&!s.loading&&!document.getElementById('viewer-breast-preset').disabled&&" +
                 "!document.getElementById('viewer-pose-basic').disabled&&document.getElementById('viewer-pose-preview').disabled,state:s});"
         }
     }
@@ -409,6 +443,22 @@ class ModelViewerRigTest {
     private fun assertBoneScale(state: JSONObject, name: String, expected: DoubleArray) {
         val scale = bone(state, name).getJSONArray("scale")
         for (axis in expected.indices) assertEquals("$name axis $axis must use the authored baseline", expected[axis], scale.getDouble(axis), 1e-6)
+    }
+
+    private fun assertReferenceOnlyControls(webView: WebView): JSONObject {
+        val result = evaluate(webView,
+            "var ids=['viewer-height','viewer-height-number','viewer-breast','viewer-breast-number'];" +
+                "return JSON.stringify({removed:ids.every(function(id){return !document.getElementById(id);}),rig:ModelViewer.getState().rig});")
+        assertTrue("Arbitrary height and continuous breast sliders must not exist", result.getBoolean("removed"))
+        val rig = result.getJSONObject("rig")
+        assertEquals("saved_settings_only", rig.getString("heightMode"))
+        assertFalse(rig.has("heightCompensation"))
+        assertEquals(2, rig.getJSONObject("body").length())
+        assertEquals("loaded", rig.getJSONObject("body").getString("breastPreset"))
+        val controls = rig.getJSONObject("scaling").getJSONArray("controls")
+        val height = (0 until controls.length()).map { controls.getJSONObject(it) }.single { it.getString("id") == "height" }
+        assertFalse(height.getBoolean("available")); assertEquals("saved_height_metadata_only", height.getString("mode"))
+        return result
     }
 
     private fun nodeWorld(webView: WebView, name: String): JSONObject = evaluate(webView,
@@ -464,6 +514,8 @@ class ModelViewerRigTest {
         assertEquals(first.getBoolean("playing"), second.getBoolean("playing"))
         assertEquals(first.getDouble("time"), second.getDouble("time"), 1e-9)
         assertEquals(first.getJSONObject("body").toString(), second.getJSONObject("body").toString())
+        assertEquals(first.getJSONObject("breastProfile").toString(), second.getJSONObject("breastProfile").toString())
+        assertEquals("saved_settings_only", second.getString("heightMode"))
         assertEquals(first.getJSONObject("nodeAdjustments").toString(), second.getJSONObject("nodeAdjustments").toString())
         assertEquals(first.getJSONArray("expressions").toString(), second.getJSONArray("expressions").toString())
         assertEquals(first.getJSONObject("savedNodes").getBoolean("enabled"), second.getJSONObject("savedNodes").getBoolean("enabled"))
@@ -481,7 +533,7 @@ class ModelViewerRigTest {
     private fun input(webView: WebView, id: String, value: String, event: String = "input") = run(webView,
         "ViewerRigQa.input(" + JSONObject.quote(id) + "," + JSONObject.quote(value) + "," + JSONObject.quote(event) + ");")
     private fun click(webView: WebView, id: String) = run(webView, "ViewerRigQa.click(" + JSONObject.quote(id) + ");")
-    private fun boneInput(webView: WebView, name: String, kind: String, axis: String, value: Int) = run(webView,
+    private fun boneInput(webView: WebView, name: String, kind: String, axis: String, value: Number) = run(webView,
         "ViewerRigQa.boneInput(" + JSONObject.quote(name) + "," + JSONObject.quote(kind) + "," + JSONObject.quote(axis) + ",$value);")
     private fun run(webView: WebView, script: String) = evaluate(webView, script + "\nreturn JSON.stringify({ok:true});")
 
