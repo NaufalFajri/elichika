@@ -47,8 +47,9 @@ def vector(x=0., y=0., z=0.):
     return {"x": x, "y": y, "z": z}
 
 
-def matrix(y=0.):
-    return {f"e{row}{column}": (1. if row == column else y if (row, column) == (1, 3) else 0.)
+def matrix(y=0., z=0.):
+    return {f"e{row}{column}": (1. if row == column else y if (row, column) == (1, 3)
+                                else z if (row, column) == (2, 3) else 0.)
             for row in range(4) for column in range(4)}
 
 
@@ -92,15 +93,21 @@ def fixture_bytes():
     mesh = add(1, 43, m_Name="NeutralRibbon", m_IsReadable=True, m_KeepVertices=True, m_KeepIndices=True)
     for path_id, name, components in ((2, "SyntheticRig", (3, 16)), (4, "Move", (5,)),
                                       (6, "BreastSize", (7,)), (8, "Tip", (9,)),
-                                      (10, "NeutralRibbon", (11, 12))):
+                                      (10, "NeutralRibbon", (11, 12)),
+                                      (19, "Head", (20,)), (21, "Neck_Hair", (22,))):
         add(path_id, 1, m_Name=name, m_IsActive=True,
             m_Component=[{"component": pointer(value)} for value in components])
-    for path_id, game, parent, children, y in ((3, 2, 0, (5, 11), 0.), (5, 4, 3, (7,), 0.),
+    for path_id, game, parent, children, y in ((3, 2, 0, (5, 11), 0.), (5, 4, 3, (7, 20, 22), 0.),
                                               (7, 6, 5, (9,), .5), (9, 8, 7, (), .5),
-                                              (11, 10, 3, (), 0.)):
+                                              (11, 10, 3, (), 0.), (20, 19, 5, (), 1.5),
+                                              (22, 21, 5, (), 1.1)):
         add(path_id, 4, m_GameObject=pointer(game), m_Father=pointer(parent),
             m_Children=[pointer(value) for value in children], m_LocalPosition=vector(y=y),
             m_LocalScale=vector(1., 1., 1.), m_LocalRotation={"x": 0., "y": 0., "z": 0., "w": 1.})
+    # Head and Neck_Hair carry no ribbon weights. They exercise the real
+    # skeleton's height-compensation matrices without changing the four-triangle
+    # framebuffer or replacing the visible weighted geometry with a mock.
+    next(tree for path_id, kind, tree in objects if path_id == 22)["m_LocalPosition"]["z"] = .1
 
     points = [(-.4, 0., 0.), (.4, 0., 0.), (-.4, .65, 0.), (.4, .65, 0.), (-.25, 1.25, 0.), (.25, 1.25, 0.)]
     channels = [{"stream": 0, "offset": 0, "format": 0, "dimension": 0} for _ in range(14)]
@@ -115,7 +122,7 @@ def fixture_bytes():
     mesh["m_VertexData"] = {"m_VertexCount": 6, "m_Channels": channels, "m_DataSize": bytes(vertices)}
     indices = [0, 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4]
     mesh["m_IndexBuffer"] = list(struct.pack("<12H", *indices))
-    mesh["m_BindPose"] = [matrix(), matrix(-.5), matrix(-1.)]
+    mesh["m_BindPose"] = [matrix(), matrix(-.5), matrix(-1.), matrix(-1.5), matrix(-1.1, -.1)]
     bounds = {"m_Center": vector(y=.625), "m_Extent": vector(.4, .625, 0.)}
     mesh["m_LocalAABB"] = bounds
     mesh["m_SubMeshes"] = [{"firstByte": 0, "indexCount": 12, "topology": 0,
@@ -128,7 +135,7 @@ def fixture_bytes():
         "fullWeights": [100.],
     }
     add(12, 137, m_GameObject=pointer(10), m_Enabled=True, m_RenderingLayerMask=1,
-        m_Mesh=pointer(1), m_Bones=[pointer(value) for value in (5, 7, 9)],
+        m_Mesh=pointer(1), m_Bones=[pointer(value) for value in (5, 7, 9, 20, 22)],
         m_RootBone=pointer(5), m_Materials=[pointer(13)], m_BlendShapeWeights=[0.], m_AABB=bounds)
     material = add(13, 21, m_Name="Neutral AS Member test material", m_Shader=pointer(18), m_CustomRenderQueue=2000)
     material["m_SavedProperties"]["m_TexEnvs"] = [
@@ -194,11 +201,11 @@ def fixture_bytes():
 def validate(data):
     env = UnityPy.load(data)
     objects = {obj.path_id: obj for obj in env.objects}
-    assert len(objects) == 18
+    assert len(objects) == 22
     mesh = MeshHandler(objects[1].read()); mesh.process()
     assert len(mesh.m_Vertices) == 6 and len(mesh.get_triangles()[0]) == 4
     assert mesh.m_BoneIndices == [(0, 0, 0, 0), (0, 0, 0, 0), (1, 0, 0, 0), (1, 0, 0, 0), (2, 0, 0, 0), (2, 0, 0, 0)]
-    assert len(objects[12].read().m_Bones) == 3
+    assert len(objects[12].read().m_Bones) == 5
     assert objects[16].read_typetree()["scaleValues"][0]["target"] == pointer(7)
     assert len(objects[15].read_typetree()["m_RotationCurves"]) == 1
     sys.path.insert(0, str(ROOT / "modtools"))
@@ -251,7 +258,11 @@ def validate(data):
         reference = attribute(static, static_bin, static["meshes"][0]["primitives"][0]["attributes"]["POSITION"])
         maximum_error = float(np.max(np.abs(result - reference)))
         assert maximum_error < 1e-7, maximum_error
-        assert rig_meta["rig"]["available"] and len(skin["joints"]) == 3
+        assert rig_meta["rig"]["available"] and len(skin["joints"]) == 5
+        height_control = next(value for value in rig_meta["rig"]["scaling"]["controls"] if value["id"] == "height")
+        assert height_control["available"] and height_control["mode"] == "height_vertical_preserve_head"
+        assert height_control["nodes"][0]["axes"] == [0, 1, 0]
+        assert {value["name"] for value in height_control["nodes"][0]["compensationRoots"]} == {"Head", "Neck_Hair"}
         assert rig_meta["rig"]["clips"][0]["name"] == "Neutral swing"
         assert rig_meta["rig"]["clips"][0]["duration"] == 2
         assert len(primitive["targets"]) == 1
@@ -265,7 +276,7 @@ def validate(data):
         assert np.allclose(saved["rotation"]["scaledQuaternion"], [math.sin(math.pi / 12), 0, 0, math.cos(math.pi / 12)])
         assert rig_meta["warnings"] == static_meta["warnings"] == []
         assert source.read_bytes() == data
-    return {"objects": len(objects), "vertices": 6, "triangles": 4, "joints": 3,
+    return {"objects": len(objects), "vertices": 6, "triangles": 4, "joints": 5,
             "morphs": 1, "clips": 1, "savedScalingEntries": 3, "restStaticMaximumError": maximum_error}
 
 
