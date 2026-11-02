@@ -39,13 +39,14 @@ class ModelViewerRigTest {
         assertSavedTransforms(state(webView))
         val referenceControls = assertReferenceOnlyControls(webView)
         run(webView, "document.getElementById('viewer-node-editor').open=true;ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('BreastSize'),'change');")
-        assertAdvancedVector(webView, "scale", doubleArrayOf(130.0, 90.0, 100.0))
+        assertAdvancedVector(webView, "scale", doubleArrayOf(1.3, .9, 1.0))
         run(webView, "ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('Tip'),'change');")
         assertAdvancedVector(webView, "position", doubleArrayOf(.1, .6, 0.0))
         assertAdvancedVector(webView, "rotation", doubleArrayOf(30.0, 0.0, 0.0))
         assertEquals("Reading imported values must not create user changes", 0,
             state(webView).getJSONObject("rig").getJSONObject("nodeAdjustments").length())
         val defaultSavedFrame = capture(webView, "savedDefault")
+        val absoluteAxes = exerciseAbsoluteAxes(webView)
         click(webView, "viewer-saved-nodes")
         fun resetAuthoredBaseline() {
             click(webView, "viewer-preview-reset")
@@ -133,7 +134,7 @@ class ModelViewerRigTest {
         assertChanged("An exact reference must change actual weighted ribbon pixels", breast)
         boneInput(webView, "BreastSize", "position", "X", .02)
         boneInput(webView, "BreastSize", "rotation", "Z", 15)
-        boneInput(webView, "BreastSize", "scale", "X", 140)
+        boneInput(webView, "BreastSize", "scale", "X", 1.4)
         val manualProfile = state(webView)
         assertTrue("A manual scale must be shown as a custom shape",
             manualProfile.getJSONObject("rig").getJSONObject("breastProfile").getBoolean("custom"))
@@ -274,6 +275,7 @@ class ModelViewerRigTest {
         val report = JSONObject().put("scope", "Original serialized Unity rig through real API/GLB/native WebGL")
             .put("poseControlsWithoutVerifiedPreview", poseControls)
             .put("defaultSavedNodes", defaultSavedNodes).put("defaultSavedFrame", defaultSavedFrame)
+            .put("absoluteSourceValueEdits", absoluteAxes)
             .put("restoredFileDefault", restoredFileDefault)
             .put("restVertices", restVertices).put("rest", rest).put("manualPose", manualPose)
             .put("referenceOnlyControls", referenceControls).put("absoluteProfiles", profileResults)
@@ -447,7 +449,7 @@ class ModelViewerRigTest {
 
     private fun assertReferenceOnlyControls(webView: WebView): JSONObject {
         val result = evaluate(webView,
-            "var ids=['viewer-height','viewer-height-number','viewer-breast','viewer-breast-number'];" +
+            "var ids=['viewer-height','viewer-height-number','viewer-breast','viewer-breast-number','viewer-skirt'];" +
                 "return JSON.stringify({removed:ids.every(function(id){return !document.getElementById(id);}),rig:ModelViewer.getState().rig});")
         assertTrue("Arbitrary height and continuous breast sliders must not exist", result.getBoolean("removed"))
         val rig = result.getJSONObject("rig")
@@ -455,10 +457,87 @@ class ModelViewerRigTest {
         assertFalse(rig.has("heightCompensation"))
         assertEquals(2, rig.getJSONObject("body").length())
         assertEquals("loaded", rig.getJSONObject("body").getString("breastPreset"))
+        assertEquals("file", rig.getJSONObject("body").getString("skirtMode"))
+        assertEquals(4, rig.getJSONObject("scaling").getInt("version"))
         val controls = rig.getJSONObject("scaling").getJSONArray("controls")
         val height = (0 until controls.length()).map { controls.getJSONObject(it) }.single { it.getString("id") == "height" }
         assertFalse(height.getBoolean("available")); assertEquals("saved_height_metadata_only", height.getString("mode"))
         return result
+    }
+
+    /** Pin only edited axes while untouched axes keep following the active source baseline. */
+    private fun exerciseAbsoluteAxes(webView: WebView): JSONObject {
+        fun assertMask(current: JSONObject, name: String, kind: String, expected: List<Double?>) {
+            val id = bone(current, name).getString("node")
+            val adjustment = current.getJSONObject("rig").getJSONObject("nodeAdjustments").getJSONObject(id)
+            assertEquals("absolute_axes", adjustment.getString("mode"))
+            val axes = adjustment.getJSONArray(kind)
+            assertEquals(3, axes.length())
+            for (axis in expected.indices) {
+                val value = expected[axis]
+                if (value == null) assertTrue("$name $kind axis $axis must inherit its baseline", axes.isNull(axis))
+                else assertEquals("$name $kind axis $axis must keep the entered endpoint", value, axes.getDouble(axis), 1e-9)
+            }
+        }
+        fun assertValues(saved: Boolean): JSONObject {
+            val current = state(webView)
+            assertBoneScale(current, "BreastSize", doubleArrayOf(1.4, if (saved) .9 else 1.0, 1.0))
+            assertArrayNear("Only the explicit Tip X is pinned; the saved Y remains inherited",
+                JSONArray(listOf(-.2, if (saved) .6 else .5, 0.0)), bone(current, "Tip").getJSONArray("position"))
+            assertUnityRotation("Only the explicit Unity Y rotation is pinned",
+                bone(current, "Tip").getJSONArray("quaternion"), doubleArrayOf(if (saved) 30.0 else 0.0, 45.0, 0.0))
+            val target = current.getJSONObject("rig").getJSONObject("breastProfile").getJSONArray("targets").getJSONObject(0)
+            assertEquals("saved", target.getString("fileStatus"))
+            assertArrayNear("File XYZ must remain immutable regardless of preview toggles", JSONArray(listOf(1.3, .9, 1.0)), target.getJSONArray("fileScale"))
+            assertArrayNear("Active XYZ is separate from immutable file XYZ", JSONArray(if (saved) listOf(1.3, .9, 1.0) else listOf(1.0, 1.0, 1.0)), target.getJSONArray("activeScale"))
+            assertArrayNear("Current XYZ includes the absolute manual factor", bone(current, "BreastSize").getJSONArray("scale"), target.getJSONArray("currentScale"))
+            assertMask(current, "BreastSize", "scale", listOf(1.4, null, null))
+            assertMask(current, "BreastSize", "position", listOf(null, null, null))
+            assertMask(current, "Tip", "position", listOf(-.2, null, null))
+            assertMask(current, "Tip", "rotation", listOf(null, 45.0, null))
+            return current
+        }
+        fun togglePart(name: String) = run(webView,
+            "var id=String(ViewerRigQa.nodeId(" + JSONObject.quote(name) + "));" +
+                "var groups=ModelViewer.getState().rig.savedNodes.groups.filter(function(group){return group.nodes.indexOf(id)>=0;});" +
+                "if(groups.length!==1)throw new Error('Expected one saved group for '+id);" +
+                "var input=Array.prototype.filter.call(document.querySelectorAll('[data-viewer-saved-part]'),function(input){return input.dataset.viewerSavedPart===groups[0].id;})[0];" +
+                "if(!input||input.disabled)throw new Error('Saved part control is unavailable');input.click();")
+
+        boneInput(webView, "BreastSize", "scale", "X", 1.4)
+        boneInput(webView, "Tip", "position", "X", .2)
+        boneInput(webView, "Tip", "rotation", "Y", 45)
+        val edited = assertValues(true)
+        click(webView, "viewer-saved-nodes")
+        val globalOff = assertValues(false)
+        click(webView, "viewer-saved-nodes")
+        assertValues(true)
+        togglePart("BreastSize"); togglePart("Tip")
+        val partsOff = assertValues(false)
+        assertTrue("Per-part opt-outs must preserve the global saved-settings selection",
+            partsOff.getJSONObject("rig").getJSONObject("savedNodes").getBoolean("enabled"))
+        togglePart("BreastSize"); togglePart("Tip")
+        assertValues(true)
+
+        input(webView, "viewer-breast-preset", "rin", "change")
+        boneInput(webView, "BreastSize", "scale", "X", 1.3)
+        val equalFile = state(webView)
+        assertBoneScale(equalFile, "BreastSize", doubleArrayOf(1.3, .95, .9))
+        assertMask(equalFile, "BreastSize", "scale", listOf(1.3, null, null))
+        click(webView, "viewer-saved-nodes")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.3, .95, .9))
+        click(webView, "viewer-breast-reset")
+        assertBoneScale(state(webView), "BreastSize", doubleArrayOf(1.0, 1.0, 1.0))
+        click(webView, "viewer-saved-nodes")
+        run(webView, "ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('Tip'),'change');")
+        click(webView, "viewer-node-reset")
+        val restored = state(webView)
+        assertSavedTransforms(restored)
+        assertEquals("Undo actions must clear only manual masks, restoring the unchanged source", 0,
+            restored.getJSONObject("rig").getJSONObject("nodeAdjustments").length())
+        return JSONObject().put("edited", edited.getJSONObject("rig")).put("globalSavedOff", globalOff.getJSONObject("rig"))
+            .put("partsSavedOff", partsOff.getJSONObject("rig")).put("sourceEqualPin", equalFile.getJSONObject("rig"))
+            .put("restored", restored.getJSONObject("rig"))
     }
 
     private fun nodeWorld(webView: WebView, name: String): JSONObject = evaluate(webView,

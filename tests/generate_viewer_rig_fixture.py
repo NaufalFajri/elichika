@@ -260,13 +260,16 @@ def validate(data):
         assert maximum_error < 1e-7, maximum_error
         assert rig_meta["rig"]["available"] and len(skin["joints"]) == 5
         height_control = next(value for value in rig_meta["rig"]["scaling"]["controls"] if value["id"] == "height")
-        assert rig_meta["rig"]["scaling"]["version"] == 3
+        assert rig_meta["rig"]["scaling"]["version"] == 4
         assert not height_control["available"] and height_control["mode"] == "saved_height_metadata_only"
         assert height_control["nodes"] == [] and not height_control["gameHeightFormulaVerified"]
         breast_control = next(value for value in rig_meta["rig"]["scaling"]["controls"] if value["id"] == "breast")
         assert breast_control["mode"] == "breast_tool_presets" and breast_control["default"] == "loaded"
         assert len(breast_control["presets"]) == 16 and breast_control["interpolation"] == "none"
         assert "curve" not in breast_control and "curveDomain" not in breast_control
+        skirt_control = next(value for value in rig_meta["rig"]["scaling"]["controls"] if value["id"] == "skirt")
+        assert skirt_control["mode"] == "absolute_skirt_root_scale"
+        assert skirt_control["unit"] == "local_scale_factor" and skirt_control["nodes"] == []
         assert rig_meta["rig"]["clips"][0]["name"] == "Neutral swing"
         assert rig_meta["rig"]["clips"][0]["duration"] == 2
         assert len(primitive["targets"]) == 1
