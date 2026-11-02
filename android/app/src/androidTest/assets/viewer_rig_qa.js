@@ -127,9 +127,34 @@
     if (matches.length !== 1) throw new Error("The real rig must have exactly one " + name + " bone");
     return matches[0].node;
   }
+  function nodeWorld(name) {
+    if (!parsedModel) throw new Error("The application's real loaded scene is unavailable");
+    parsedModel.updateMatrixWorld(true);
+    var id = String(nodeId(name)), matches = [];
+    parsedModel.traverse(function (object) {
+      if (!(object.userData && object.userData.viewerHelper) && object.userData &&
+          String(object.userData.elichika_node) === id) matches.push(object);
+    });
+    if (matches.length !== 1) throw new Error("The actual scene must have exactly one source node " + name);
+    var target = matches[0], values = target.matrixWorld.toArray();
+    return { node: id, name: name, matrix: values,
+      position: values.slice(12, 15),
+      linear: [values[0], values[1], values[2], values[4], values[5], values[6], values[8], values[9], values[10]],
+      localScale: target.scale.toArray(), localPosition: target.position.toArray(),
+      localQuaternion: target.quaternion.toArray(), matrixAutoUpdate: target.matrixAutoUpdate };
+  }
   window.ViewerRigQa = {
-    capture: capture, deformedVertices: deformedVertices, nodeId: nodeId, control: control,
+    capture: capture, deformedVertices: deformedVertices, nodeId: nodeId, nodeWorld: nodeWorld, control: control,
     input: function (id, value, event) {
+      if (id === "viewer-expression-value") {
+        element("viewer-expression-advanced").open = true;
+        var select = interactive("viewer-expression");
+        if (!select.value) {
+          var first = Array.prototype.filter.call(select.options, function (option) { return !!option.value; })[0];
+          if (!first) throw new Error("The original expression channel selector has no usable target");
+          select.value = first.value; select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
       var target = interactive(id); target.value = String(value);
       target.dispatchEvent(new Event(event || "input", { bubbles: true }));
       return state();
