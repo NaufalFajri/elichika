@@ -171,6 +171,8 @@ class ModelViewerRigTest {
         boneInput(webView, "Tip", "rotation", "X", 20)
         val retainedState = state(webView)
         capture(webView, "retained")
+        val quality = ViewerQualityNativeQa.exercise(webView, "neutral-rig-quality", 4, 4)
+        val highQualityReference = quality.getString("hqReferenceFrame")
         run(webView, "document.querySelector('.tab[data-tab=\"tools\"]').click();")
         assertFalse(state(webView).getBoolean("visible"))
         Thread.sleep(250)
@@ -180,12 +182,17 @@ class ModelViewerRigTest {
             "var s=ModelViewer.getState();return JSON.stringify({ok:s.visible&&s.loaded&&!s.loading,error:s.error,state:s});"
         }
         assertRetained(retainedState, state(webView))
-        val afterTab = capture(webView, compare = "retained")
+        val afterTab = capture(webView, compare = highQualityReference)
         assertRestored("Returning to the viewer must retain its actual adjusted image", afterTab)
         recoverContext(webView)
         assertRetained(retainedState, state(webView))
-        val afterContext = capture(webView, compare = "retained")
+        val afterContext = capture(webView, compare = highQualityReference)
         assertRestored("A restored native WebGL context must retain the adjusted model", afterContext)
+        run(webView, "ViewerQualityQa.set(false);")
+        waitForDom(webView, "the original standard quality after context recovery") {
+            "var s=ModelViewer.getState();return JSON.stringify({ok:s.quality.ready&&!s.quality.enabled,state:s});"
+        }
+        assertRestored("Standard mode must retain its original adjusted image after HQ lifecycle checks", capture(webView, compare = "retained"))
         saveScreenshot(session.activity, "model-viewer-rig.png")
         click(webView, "viewer-preview-reset")
         assertTrue(state(webView).getJSONObject("rig").getJSONObject("savedNodes").getBoolean("enabled"))
@@ -201,6 +208,7 @@ class ModelViewerRigTest {
             .put("restVertices", restVertices).put("rest", rest).put("manualPose", manualPose)
             .put("height", height).put("breast", breast).put("savedEntry", saved).put("expression", expression)
             .put("scrub", scrub).put("playing", playing).put("paused", paused)
+            .put("highQuality3D", quality)
             .put("afterTab", afterTab).put("afterContext", afterContext)
             .put("sourcePreserved", true).put("gameServerRemainedStopped", true)
         persistReport("model-viewer-rig-report.json", report)
@@ -216,6 +224,8 @@ class ModelViewerRigTest {
         val member = capture(webView, "member")
         assertEquals("Source geometry excludes helper outlines", 4, member.getJSONObject("probe").getInt("sourceTriangles"))
         assertEquals("GPU metrics must include the real outline draw", 8, member.getJSONObject("probe").getInt("triangles"))
+        val quality = ViewerQualityNativeQa.exercise(webView, "member-shader-quality", 4, 8,
+            leaveEnabled = false, centerRgb = intArrayOf(14, 63, 84))
         assertRgb("AS/Member must apply the authored blue-mask in source Gamma space", member.getJSONArray("centerRGB"), intArrayOf(14, 63, 84))
         input(webView, "viewer-shader", "basic", "change")
         val basic = capture(webView, compare = "member")
@@ -245,7 +255,7 @@ class ModelViewerRigTest {
         assertEquals(8, recovered.getJSONObject("probe").getInt("triangles"))
         assertRgb("Context restoration must retain the source Gamma shader output", recovered.getJSONArray("centerRGB"), intArrayOf(14, 63, 84))
         saveScreenshot(session.activity, "model-viewer-shader.png")
-        val report = JSONObject().put("member", member).put("basic", basic)
+        val report = JSONObject().put("member", member).put("basic", basic).put("highQuality3D", quality)
             .put("posed", posed).put("hidden", hidden).put("recovered", recovered)
             .put("sourcePreserved", true).put("gameServerRemainedStopped", true)
         persistReport("model-viewer-shader-report.json", report)
@@ -308,7 +318,7 @@ class ModelViewerRigTest {
             assertTrue("All rig, shader and scaling operations must preserve the source bytes", source.readBytes().contentEquals(fixture))
             assertGameStopped()
         } finally {
-            webView?.let { runCatching { run(it, "if(window.ViewerRigQa)ViewerRigQa.dispose();") } }
+            webView?.let { runCatching { run(it, "if(window.ViewerQualityQa)ViewerQualityQa.dispose();if(window.ViewerRigQa)ViewerRigQa.dispose();") } }
             instrumentation.runOnMainSync { activity?.finish() }
             source.delete()
             preferences.edit().apply { if (hadGuide) putBoolean("seen_guide", seenGuide) else remove("seen_guide") }.commit()
