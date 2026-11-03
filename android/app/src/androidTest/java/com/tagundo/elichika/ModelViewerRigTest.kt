@@ -1,13 +1,18 @@
 package com.tagundo.elichika
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Environment
 import android.view.View
+import android.view.KeyEvent
+import android.view.WindowManager
 import android.view.ViewGroup
 import android.webkit.WebView
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -47,6 +52,8 @@ class ModelViewerRigTest {
             state(webView).getJSONObject("rig").getJSONObject("nodeAdjustments").length())
         val defaultSavedFrame = capture(webView, "savedDefault")
         val absoluteAxes = exerciseAbsoluteAxes(webView)
+        val childCompensation = exerciseChildCompensation(webView)
+        assertRestored("Compensation undo must restore the exact original saved-file pixels", capture(webView, compare = "savedDefault"))
         click(webView, "viewer-saved-nodes")
         fun resetAuthoredBaseline() {
             click(webView, "viewer-preview-reset")
@@ -239,7 +246,13 @@ class ModelViewerRigTest {
         boneInput(webView, "Head", "rotation", "Z", 35)
         val retainedState = state(webView)
         val retainedHeadWorld = nodeWorld(webView, "Head")
+        val sections = exerciseSectionCollapse(session, retainedState)
+        val fullscreen = exerciseFullscreen(session, retainedState)
         capture(webView, "retained")
+        persistReport("model-viewer-viewport-milestones.json", JSONObject()
+            .put("scope", "Strict new-feature milestones captured before the unchanged quality exercise")
+            .put("absoluteSourceValueEdits", absoluteAxes).put("childBoneCompensation", childCompensation)
+            .put("collapsibleSections", sections).put("fullscreenViewport", fullscreen))
         val quality = ViewerQualityNativeQa.exercise(webView, "neutral-rig-quality", 4, 4)
         val highQualityReference = quality.getString("hqReferenceFrame")
         run(webView, "document.querySelector('.tab[data-tab=\"tools\"]').click();")
@@ -275,7 +288,7 @@ class ModelViewerRigTest {
         val report = JSONObject().put("scope", "Original serialized Unity rig through real API/GLB/native WebGL")
             .put("poseControlsWithoutVerifiedPreview", poseControls)
             .put("defaultSavedNodes", defaultSavedNodes).put("defaultSavedFrame", defaultSavedFrame)
-            .put("absoluteSourceValueEdits", absoluteAxes)
+            .put("absoluteSourceValueEdits", absoluteAxes).put("childBoneCompensation", childCompensation)
             .put("restoredFileDefault", restoredFileDefault)
             .put("restVertices", restVertices).put("rest", rest).put("manualPose", manualPose)
             .put("referenceOnlyControls", referenceControls).put("absoluteProfiles", profileResults)
@@ -283,7 +296,7 @@ class ModelViewerRigTest {
             .put("multiAxisHeadQuaternion", multiAxisHead)
             .put("breast", breast).put("savedEntry", saved).put("expression", expression)
             .put("scrub", scrub).put("playing", playing).put("paused", paused)
-            .put("highQuality3D", quality)
+            .put("collapsibleSections", sections).put("fullscreenViewport", fullscreen).put("highQuality3D", quality)
             .put("afterTab", afterTab).put("afterContext", afterContext)
             .put("sourcePreserved", true).put("gameServerRemainedStopped", true)
         persistReport("model-viewer-rig-report.json", report)
@@ -400,6 +413,221 @@ class ModelViewerRigTest {
         }
     }
 
+    private fun exerciseSectionCollapse(session: Session, retained: JSONObject): JSONArray {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val originallyExpanded = retained.getJSONObject("layout").getBoolean("expanded")
+        val results = JSONArray()
+        if (originallyExpanded) {
+            click(session.webView, "viewer-expand")
+            waitForDom(session.webView, "the normal editing layout", 30) {
+                "var s=ModelViewer.getState();return JSON.stringify({ok:!s.layout.expanded,state:s});"
+            }
+        }
+        try {
+            run(session.webView, "var id=ModelViewer.getState().rig.selectedNode;" +
+                "var shortcut=Array.prototype.filter.call(document.querySelectorAll('#viewer-node-shortcuts [data-viewer-bone]'),function(button){return button.dataset.viewerBone===id;})[0];" +
+                "if(!shortcut)throw new Error('The selected frequent bone must have a shortcut');shortcut.click();")
+            val sections = listOf("viewer-common-adjustments", "viewer-breast-card", "viewer-skirt-card")
+            for (id in sections) {
+                val content = if (id == "viewer-common-adjustments") "#viewer-node-shortcuts" else ".viewer-card-content"
+                val closed = evaluate(session.webView,
+                    "var card=document.getElementById(" + JSONObject.quote(id) + "),summary=card.querySelector('summary'),content=card.querySelector(" + JSONObject.quote(content) + ");" +
+                        "if(!card.open||content.getBoundingClientRect().height<=0)" +
+                        "throw new Error('The normal editing section must initially show its source controls');" +
+                        "summary.scrollIntoView({block:'center'});summary.click();" +
+                        "return JSON.stringify({id:card.id,open:card.open,summaryHeight:summary.getBoundingClientRect().height," +
+                        "contentHeight:content.getBoundingClientRect().height,states:['viewer-common-adjustments','viewer-breast-card','viewer-skirt-card'].map(function(id){return {id:id,open:document.getElementById(id).open};})});")
+                assertFalse("Native details must hide its controls when collapsed", closed.getBoolean("open"))
+                assertEquals("Collapsed content must occupy no space on the native WebView", 0.0, closed.getDouble("contentHeight"), 1e-6)
+                assertTrue("A collapsed section keeps a 44 px summary target", closed.getDouble("summaryHeight") >= 44)
+                val sectionStates = closed.getJSONArray("states")
+                for (index in 0 until sectionStates.length()) {
+                    val section = sectionStates.getJSONObject(index)
+                    assertEquals("Each section must collapse independently", section.getString("id") != id, section.getBoolean("open"))
+                }
+                assertRetained(retained, state(session.webView))
+                assertEquals("Collapsing preserves the shortcut-selected bone", retained.getJSONObject("rig").getString("selectedNode"), state(session.webView).getJSONObject("rig").getString("selectedNode"))
+                instrumentation.runOnMainSync { session.webView.requestFocus() }
+                run(session.webView, "var summary=document.getElementById(" + JSONObject.quote(id) + ").querySelector('summary');summary.focus();" +
+                    "if(document.activeElement!==summary)throw new Error('The native section summary cannot receive keyboard focus');")
+                instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_ENTER)
+                val opened = waitForDom(session.webView, "keyboard reopening $id", 15) {
+                    "var card=document.getElementById(" + JSONObject.quote(id) + ");return JSON.stringify({ok:card.open&&" +
+                        "card.querySelector(" + JSONObject.quote(content) + ").getBoundingClientRect().height>0,open:card.open});"
+                }
+                val current = state(session.webView)
+                assertRetained(retained, current)
+                assertEquals("Keyboard reopening preserves the shortcut-selected bone", retained.getJSONObject("rig").getString("selectedNode"), current.getJSONObject("rig").getString("selectedNode"))
+                for (kind in listOf("position", "target")) assertArrayNear("Section toggling preserves camera $kind",
+                    retained.getJSONObject("camera").getJSONArray(kind), current.getJSONObject("camera").getJSONArray(kind))
+                assertEquals(retained.getJSONObject("camera").getDouble("fov"), current.getJSONObject("camera").getDouble("fov"), 1e-9)
+                results.put(JSONObject().put("id", id).put("closed", closed).put("keyboardReopened", opened))
+            }
+            return results
+        } finally {
+            if (state(session.webView).getJSONObject("layout").getBoolean("expanded") != originallyExpanded) click(session.webView, "viewer-expand")
+            waitForDom(session.webView, "the original expanded preview geometry", 30) {
+                "var s=ModelViewer.getState(),stage=s.layout.stage;return JSON.stringify({ok:s.layout.expanded===" + originallyExpanded +
+                    "&&Math.abs(stage.width-" + retained.getJSONObject("layout").getJSONObject("stage").getDouble("width") +
+                    ")<1&&Math.abs(stage.height-" + retained.getJSONObject("layout").getJSONObject("stage").getDouble("height") + ")<1,state:s});"
+            }
+        }
+    }
+
+    /** Exercise the real Android window and the existing renderer without creating a second viewer. */
+    private fun exerciseFullscreen(session: Session, retained: JSONObject): JSONObject {
+        val activity = session.activity
+        val webView = session.webView
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val originalRequested = activity.requestedOrientation
+        val originalOrientation = activity.resources.configuration.orientation
+        val normalNative = nativeViewport(session)
+        val normalLayout = retained.getJSONObject("layout")
+        val normalFrame = capture(webView)
+        assertEquals("none", normalLayout.getString("fullscreen"))
+        assertTrue("The existing expanded-preview choice must survive fullscreen", normalLayout.getBoolean("expanded"))
+        fun assertPreserved(): JSONObject {
+            val current = state(webView)
+            assertRetained(retained, current)
+            for (kind in listOf("position", "target")) assertArrayNear("Resizing must preserve camera $kind",
+                retained.getJSONObject("camera").getJSONArray(kind), current.getJSONObject("camera").getJSONArray(kind))
+            assertEquals(retained.getJSONObject("camera").getDouble("fov"), current.getJSONObject("camera").getDouble("fov"), 1e-9)
+            return current
+        }
+        fun waitMode(mode: String) = waitForDom(webView, "native fullscreen mode $mode", 30) {
+            "var s=ModelViewer.getState();return JSON.stringify({ok:s.layout.fullscreen==='" + mode +
+                "'&&!s.layout.fullscreenPending&&s.loaded&&!s.loading,error:s.error,state:s});"
+        }
+        fun enter() {
+            instrumentation.runOnMainSync { webView.requestFocus() }
+            click(webView, "viewer-fullscreen"); waitMode("native")
+        }
+        fun assertNormal(checkFocus: Boolean = true): JSONObject {
+            val current = waitNativeViewport(session, "restored app chrome") {
+                it.getInt("headerVisibility") == normalNative.getInt("headerVisibility") &&
+                    it.getInt("tabsVisibility") == normalNative.getInt("tabsVisibility") &&
+                    it.getInt("systemUiVisibility") == normalNative.getInt("systemUiVisibility") &&
+                    it.getInt("windowFlags") == normalNative.getInt("windowFlags")
+            }
+            assertEquals("Fullscreen Back must stay on the modeling-tools tab", 4, current.getInt("selectedTab"))
+            assertTrue(current.getBoolean("webViewAttached"))
+            if (checkFocus) assertEquals("Leaving fullscreen restores the original native focus target", normalNative.getInt("focusIdentity"), current.getInt("focusIdentity"))
+            val state = assertPreserved()
+            assertEquals(normalLayout.getBoolean("expanded"), state.getJSONObject("layout").getBoolean("expanded"))
+            return current
+        }
+        try {
+            enter()
+            val entered = waitNativeViewport(session, "fullscreen app chrome and viewport") {
+                it.getInt("headerVisibility") == View.GONE && it.getInt("tabsVisibility") == View.GONE &&
+                    it.getInt("webViewHeight") > normalNative.getInt("webViewHeight")
+            }
+            assertTrue("Fullscreen must set the native window flag", (entered.getInt("windowFlags") and WindowManager.LayoutParams.FLAG_FULLSCREEN) != 0)
+            val immersiveFlags = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            assertEquals("Fullscreen must hide Android status/navigation bars", immersiveFlags, entered.getInt("systemUiVisibility") and immersiveFlags)
+            val enteredState = assertPreserved()
+            assertTrue("Fullscreen must give actual model pixels more height",
+                enteredState.getJSONObject("layout").getJSONObject("stage").getDouble("height") > normalLayout.getJSONObject("stage").getDouble("height"))
+            val fullscreenFrame = capture(webView)
+            assertEquals(4, fullscreenFrame.getJSONObject("probe").getInt("sourceTriangles"))
+            assertTrue("Native fullscreen must visibly enlarge actual model pixels",
+                fullscreenFrame.getInt("foregroundPixelHeight") > normalFrame.getInt("foregroundPixelHeight") * 1.08)
+            run(webView, "ElichikaViewerFullscreen.postMessage('enter');ElichikaViewerFullscreen.postMessage('enter');")
+            waitMode("native"); assertPreserved()
+            val opposite = if (originalOrientation == Configuration.ORIENTATION_LANDSCAPE)
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            instrumentation.runOnMainSync { activity.requestedOrientation = opposite }
+            val rotated = waitNativeViewport(session, "fullscreen orientation change") {
+                it.getInt("orientation") != originalOrientation && it.getInt("headerVisibility") == View.GONE &&
+                    it.getInt("tabsVisibility") == View.GONE && it.getBoolean("hasFocus")
+            }
+            waitMode("native"); assertPreserved()
+            waitForDom(webView, "the rotated WebView viewport", 30) {
+                "var s=ModelViewer.getState(),v=s.layout.viewport;return JSON.stringify({ok:" +
+                    (if (originalOrientation == Configuration.ORIENTATION_LANDSCAPE) "v.height>v.width" else "v.width>v.height") + ",state:s});"
+            }
+            val rendered = capture(webView)
+            assertEquals(4, rendered.getJSONObject("probe").getInt("sourceTriangles"))
+            assertTrue("The rotated fullscreen must render the actual weighted model", rendered.getInt("foregroundPixels") >= 64)
+            saveScreenshot(activity, "model-viewer-fullscreen.png")
+            instrumentation.runOnMainSync { activity.requestedOrientation = if (originalOrientation == Configuration.ORIENTATION_LANDSCAPE)
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT }
+            waitNativeViewport(session, "original fullscreen orientation") { it.getInt("orientation") == originalOrientation && it.getBoolean("hasFocus") }
+            waitMode("native"); assertPreserved()
+            instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+            waitMode("none")
+            val afterBack = assertNormal()
+            run(webView, "ElichikaViewerFullscreen.postMessage('exit');ElichikaViewerFullscreen.postMessage('exit');")
+            waitMode("none"); assertNormal()
+            enter()
+            instrumentation.runOnMainSync { activity.findViewById<TabLayout>(R.id.tabs).getTabAt(0)!!.select() }
+            waitNativeViewport(session, "fullscreen cleanup on a native tab change") {
+                it.getInt("selectedTab") == 0 && it.getInt("headerVisibility") == normalNative.getInt("headerVisibility") &&
+                    it.getInt("tabsVisibility") == normalNative.getInt("tabsVisibility")
+            }
+            instrumentation.runOnMainSync { activity.findViewById<TabLayout>(R.id.tabs).getTabAt(4)!!.select() }
+            waitMode("none")
+            val afterNativeTab = assertNormal(checkFocus = false)
+            enter()
+            assertTrue("The framework must accept Home for the actual onStop lifecycle", instrumentation.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME))
+            waitNativeViewport(session, "background fullscreen cleanup") {
+                !it.getBoolean("hasFocus") && it.getInt("headerVisibility") == normalNative.getInt("headerVisibility") &&
+                    it.getInt("tabsVisibility") == normalNative.getInt("tabsVisibility")
+            }
+            instrumentation.runOnMainSync { activity.startActivity(Intent(activity, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)) }
+            waitNativeViewport(session, "the same activity returning from Home") { it.getBoolean("hasFocus") && it.getBoolean("webViewAttached") }
+            waitMode("none")
+            val afterLifecycle = assertNormal()
+            enter()
+            val exit = evaluate(webView, "return JSON.stringify(ViewerRigQa.control('viewer-fullscreen',false));")
+            assertTrue("The fullscreen exit must remain a visible, reachable 44 px target", exit.getBoolean("visible") && exit.getBoolean("withinViewport") && exit.getBoolean("hittable") && exit.getDouble("width") >= 44 && exit.getDouble("height") >= 44)
+            click(webView, "viewer-fullscreen"); waitMode("none")
+            val restored = assertNormal()
+            waitNativeViewport(session, "the unchanged original preview dimensions") {
+                it.getInt("webViewWidth") == normalNative.getInt("webViewWidth") && it.getInt("webViewHeight") == normalNative.getInt("webViewHeight")
+            }
+            waitForDom(webView, "the restored renderer stage dimensions", 30) {
+                "var s=ModelViewer.getState(),stage=s.layout.stage;return JSON.stringify({ok:Math.abs(stage.width-" +
+                    normalLayout.getJSONObject("stage").getDouble("width") + ")<1&&Math.abs(stage.height-" +
+                    normalLayout.getJSONObject("stage").getDouble("height") + ")<1,state:s});"
+            }
+            return JSONObject().put("normal", normalNative).put("normalFrame", normalFrame).put("entered", entered)
+                .put("fullscreenFrame", fullscreenFrame).put("rotated", rotated)
+                .put("renderedFullscreen", rendered).put("afterBack", afterBack).put("afterNativeTab", afterNativeTab)
+                .put("afterLifecycle", afterLifecycle).put("restored", restored)
+        } finally {
+            instrumentation.runOnMainSync { activity.requestedOrientation = originalRequested }
+        }
+    }
+
+    private fun nativeViewport(session: Session): JSONObject {
+        val result = AtomicReference<JSONObject>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val activity = session.activity
+            val tabs = activity.findViewById<TabLayout>(R.id.tabs)
+            result.set(JSONObject().put("headerVisibility", activity.findViewById<View>(R.id.app_header).visibility)
+                .put("tabsVisibility", tabs.visibility).put("selectedTab", tabs.selectedTabPosition)
+                .put("webViewWidth", session.webView.width).put("webViewHeight", session.webView.height)
+                .put("webViewAttached", session.webView.isAttachedToWindow && session.webView.visibility == View.VISIBLE)
+                .put("hasFocus", activity.hasWindowFocus()).put("focusIdentity", System.identityHashCode(activity.currentFocus))
+                .put("orientation", activity.resources.configuration.orientation)
+                .put("systemUiVisibility", activity.window.decorView.systemUiVisibility).put("windowFlags", activity.window.attributes.flags))
+        }
+        return result.get()
+    }
+
+    private fun waitNativeViewport(session: Session, description: String, accept: (JSONObject) -> Boolean): JSONObject {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+        var observed = JSONObject()
+        while (System.nanoTime() < deadline) {
+            observed = nativeViewport(session)
+            if (accept(observed)) return observed
+            Thread.sleep(100)
+        }
+        throw AssertionError("Timed out waiting for $description: $observed")
+    }
+
     private fun recoverContext(webView: WebView) {
         run(webView, "ViewerRigQa.loseContext();")
         waitForDom(webView, "actual native context loss", 30) {
@@ -463,6 +691,72 @@ class ModelViewerRigTest {
         val height = (0 until controls.length()).map { controls.getJSONObject(it) }.single { it.getString("id") == "height" }
         assertFalse(height.getBoolean("available")); assertEquals("saved_height_metadata_only", height.getString("mode"))
         return result
+    }
+
+    private fun exerciseChildCompensation(webView: WebView): JSONObject {
+        val start = state(webView)
+        val initiallyExpanded = start.getJSONObject("layout").getBoolean("expanded")
+        if (initiallyExpanded) click(webView, "viewer-expand")
+        try {
+            boneInput(webView, "BreastSize", "position", "X", .05)
+            boneInput(webView, "BreastSize", "rotation", "Z", 35)
+            boneInput(webView, "Tip", "position", "X", .15)
+            boneInput(webView, "Tip", "scale", "X", 1.1)
+            boneInput(webView, "Tip", "rotation", "Y", 20)
+            val referenceState = state(webView)
+            val referenceWorld = nodeWorld(webView, "Tip")
+            run(webView, "ViewerRigQa.input('viewer-node',ViewerRigQa.nodeId('BreastSize'),'change');")
+            val defaultOff = evaluate(webView,
+                "return JSON.stringify({checked:document.getElementById('bone-compensate-children').checked," +
+                    "mode:document.getElementById('bone-compensate-target').value});")
+            assertFalse("Child compensation must begin as an explicit opt-in", defaultOff.getBoolean("checked"))
+            assertEquals("auto", defaultOff.getString("mode"))
+            click(webView, "bone-compensate-children")
+            boneInput(webView, "BreastSize", "scale", "X", 1.56)
+            boneInput(webView, "BreastSize", "scale", "Y", 1.17)
+            boneInput(webView, "BreastSize", "scale", "Z", .8)
+            val correctedState = state(webView)
+            val correctedWorld = nodeWorld(webView, "Tip")
+            assertBoneScale(correctedState, "BreastSize", doubleArrayOf(1.56, 1.17, .8))
+            assertArrayNear("The rotated, nonuniform parent must preserve the child's complete actual world transform",
+                referenceWorld.getJSONArray("matrix"), correctedWorld.getJSONArray("matrix"))
+            for (kind in listOf("position", "quaternion", "scale")) assertArrayNear("Compensation must retain the child's own manual $kind",
+                bone(referenceState, "Tip").getJSONArray(kind), bone(correctedState, "Tip").getJSONArray(kind))
+            for (kind in listOf("position", "quaternion")) assertArrayNear("Compensation must retain the parent's requested $kind",
+                bone(referenceState, "BreastSize").getJSONArray(kind), bone(correctedState, "BreastSize").getJSONArray(kind))
+            val parentId = bone(correctedState, "BreastSize").getString("node")
+            val parents = correctedState.getJSONObject("rig").getJSONObject("compensation").getJSONArray("parents")
+            val status = (0 until parents.length()).map { parents.getJSONObject(it) }.single { it.getString("node") == parentId }
+            assertEquals("active", status.getString("state"))
+            assertArrayNear("Compensation uses each explicit factor relative to the active imported baseline",
+                JSONArray(listOf(1.2, 1.3, .8)), status.getJSONArray("scaleDelta"))
+            click(webView, "bone-compensate-children")
+            val propagated = nodeWorld(webView, "Tip")
+            assertTrue("Opting out must visibly restore normal parent propagation",
+                (0 until 16).maxOf { kotlin.math.abs(propagated.getJSONArray("matrix").getDouble(it) - referenceWorld.getJSONArray("matrix").getDouble(it)) } > .05)
+            click(webView, "bone-compensate-children")
+            assertArrayNear("Repeated compensation must not compound corrections", referenceWorld.getJSONArray("matrix"), nodeWorld(webView, "Tip").getJSONArray("matrix"))
+            click(webView, "viewer-node-reset")
+            val parentReset = state(webView)
+            assertFalse("Reset this bone clears its compensation opt-in", parentReset.getJSONObject("rig").getJSONObject("nodeCompensations").has(parentId))
+            assertEquals("Clearing compensation restores the child's normal matrix updates", referenceWorld.getBoolean("matrixAutoUpdate"), nodeWorld(webView, "Tip").getBoolean("matrixAutoUpdate"))
+            for (kind in listOf("position", "quaternion", "scale")) assertArrayNear("Resetting the parent preserves the child's own $kind edits",
+                bone(referenceState, "Tip").getJSONArray(kind), bone(parentReset, "Tip").getJSONArray(kind))
+            click(webView, "viewer-preview-reset")
+            val restored = state(webView)
+            assertSavedTransforms(restored)
+            assertEquals(0, restored.getJSONObject("rig").getJSONObject("nodeAdjustments").length())
+            assertEquals(0, restored.getJSONObject("rig").getJSONObject("nodeCompensations").length())
+            return JSONObject().put("defaultOff", defaultOff).put("referenceWorld", referenceWorld).put("correctedWorld", correctedWorld)
+                .put("normalPropagationWorld", propagated).put("status", status).put("childEditsPreserved", true).put("resetToSource", true)
+        } finally {
+            if (state(webView).getJSONObject("layout").getBoolean("expanded") != initiallyExpanded) click(webView, "viewer-expand")
+            waitForDom(webView, "the source preview after compensation cleanup", 30) {
+                "var s=ModelViewer.getState(),stage=s.layout.stage;return JSON.stringify({ok:s.layout.expanded===" + initiallyExpanded +
+                    "&&Math.abs(stage.width-" + start.getJSONObject("layout").getJSONObject("stage").getDouble("width") +
+                    ")<1&&Math.abs(stage.height-" + start.getJSONObject("layout").getJSONObject("stage").getDouble("height") + ")<1,state:s});"
+            }
+        }
     }
 
     /** Pin only edited axes while untouched axes keep following the active source baseline. */
@@ -596,6 +890,7 @@ class ModelViewerRigTest {
         assertEquals(first.getJSONObject("breastProfile").toString(), second.getJSONObject("breastProfile").toString())
         assertEquals("saved_settings_only", second.getString("heightMode"))
         assertEquals(first.getJSONObject("nodeAdjustments").toString(), second.getJSONObject("nodeAdjustments").toString())
+        assertEquals(first.getJSONObject("nodeCompensations").toString(), second.getJSONObject("nodeCompensations").toString())
         assertEquals(first.getJSONArray("expressions").toString(), second.getJSONArray("expressions").toString())
         assertEquals(first.getJSONObject("savedNodes").getBoolean("enabled"), second.getJSONObject("savedNodes").getBoolean("enabled"))
         assertEquals(first.getJSONObject("savedNodes").getInt("applied"), second.getJSONObject("savedNodes").getInt("applied"))

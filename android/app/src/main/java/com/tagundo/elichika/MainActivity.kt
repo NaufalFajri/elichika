@@ -3,6 +3,7 @@ package com.tagundo.elichika
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -68,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     // with a running edit/extraction no longer wipes its live page state.
     private val webViewErrored = HashMap<String, Boolean>()
     private val savedWebViews = HashMap<String, Bundle>()
+    private lateinit var viewerFullscreen: ViewerFullscreen
 
     // File picker for addon zips: copies the chosen file into Download/sukusta/addons,
     // where the dev-tools installers pick it up.
@@ -106,6 +108,10 @@ class MainActivity : AppCompatActivity() {
         content = findViewById(R.id.content)
         statusText = findViewById(R.id.txt_status)
         toggle = findViewById(R.id.btn_toggle)
+        viewerFullscreen = ViewerFullscreen(this,
+            listOf(findViewById(R.id.app_header), findViewById(R.id.tabs))) { view ->
+            currentTab == 4 && webViews[tabs[4].url] === view && view.visibility == View.VISIBLE
+        }
 
         consolePanel = layoutInflater.inflate(R.layout.panel_console, content, false)
         logText = consolePanel.findViewById(R.id.log_text)
@@ -137,6 +143,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
+        if (viewerFullscreen.exit()) return
         // Let the active WebView consume Back (navigate its own history) first, then
         // fall back to the Console tab, and only then exit the app.
         val tab = tabs[currentTab]
@@ -238,6 +245,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        viewerFullscreen.onStart()
         // A split-screen window may be paused while still visible. Keep its status
         // and console subscribed until it is actually stopped.
         Bus.addListener(this, { appendLog(it) }, { updateRunning(it) }, { updateToolsState() })
@@ -248,8 +256,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        viewerFullscreen.onStop()
         Bus.removeListener(this)
         super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewerFullscreen.reapply()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && ::viewerFullscreen.isInitialized) viewerFullscreen.reapply()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        viewerFullscreen.reapply()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -267,6 +291,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         Bus.removeListener(this)
+        viewerFullscreen.dispose()
         webViews.values.forEach { webView ->
             content.removeView(webView)
             webView.destroy()
@@ -482,6 +507,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showTab(index: Int) {
+        if (index != currentTab) viewerFullscreen.exit()
         currentTab = index
         val tab = tabs[index]
         // Hide everything, then show the selected view (creating WebViews on demand).
@@ -523,13 +549,21 @@ class MainActivity : AppCompatActivity() {
                 if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
                     WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, true)
                 }
+                if (url == tabs[4].url) viewerFullscreen.attach(this)
                 // Keep all navigation (links, form submits) inside the WebView instead
                 // of handing it to the system browser (Chrome), which is the default
                 // when no WebViewClient is set. Also track main-frame load failures so
                 // showTab() only reloads tabs that errored (see webViewErrored).
                 webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: android.webkit.WebResourceRequest): Boolean =
+                        viewerFullscreen.shouldOverride(view, request)
+
                     override fun onPageStarted(view: WebView?, u: String?, favicon: android.graphics.Bitmap?) {
+                        if (view != null) viewerFullscreen.onPageStarted(view)
                         if (u != null && u.startsWith(url)) webViewErrored[url] = false
+                    }
+                    override fun onPageFinished(view: WebView?, u: String?) {
+                        if (view != null) viewerFullscreen.onPageFinished(view)
                     }
                     override fun onReceivedError(
                         view: WebView?,

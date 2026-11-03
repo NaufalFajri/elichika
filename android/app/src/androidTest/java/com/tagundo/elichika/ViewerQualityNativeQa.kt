@@ -52,18 +52,15 @@ object ViewerQualityNativeQa {
         val prior = state(webView)
         val priorQuality = prior.getJSONObject("quality")
         action(webView, "document.getElementById('viewer-expand').click();")
-        val resized = waitFor(webView, "the HQ renderbuffer to follow the actual viewer resize") {
-            "var s=ModelViewer.getState(),q=s.quality;return JSON.stringify({ok:q&&q.ready&&q.enabled&&" +
-                "(q.width!==${priorQuality.getInt("width")}||q.height!==${priorQuality.getInt("height")}),state:s});"
-        }
+        val resized = waitForSizedDriver(webView, "the HQ renderbuffer to follow the actual viewer resize", true,
+            "q.width!==${priorQuality.getInt("width")}||q.height!==${priorQuality.getInt("height")}")
         assertStableModel(prior, resized.getJSONObject("state"))
-        assertDimensions(driver(webView), true)
+        assertDimensions(resized.getJSONObject("driver"), true)
         action(webView, "document.getElementById('viewer-expand').click();")
-        waitFor(webView, "the original HQ renderbuffer dimensions") {
-            "var q=ModelViewer.getState().quality;return JSON.stringify({ok:q&&q.ready&&q.width===${priorQuality.getInt("width")}" +
-                "&&q.height===${priorQuality.getInt("height")}});"
-        }
-        assertStableModel(before, state(webView))
+        val returned = waitForSizedDriver(webView, "the original HQ renderbuffer dimensions", true,
+            "q.width===${priorQuality.getInt("width")}&&q.height===${priorQuality.getInt("height")}")
+        assertStableModel(before, returned.getJSONObject("state"))
+        assertDimensions(returned.getJSONObject("driver"), true)
         val afterResize = frame(webView, compare = prefix + "-hq")
         assertExact("Returning from resize must restore the exact HQ frame", afterResize)
 
@@ -142,7 +139,7 @@ object ViewerQualityNativeQa {
 
     private fun assertDimensions(observation: JSONObject, high: Boolean) {
         val q = observation.getJSONObject("quality")
-        assertTrue("The actual quality pipeline must be ready", q.getBoolean("ready"))
+        assertTrue("The actual quality pipeline must be ready; observation=$observation", q.getBoolean("ready"))
         assertEquals(high, q.getBoolean("enabled"))
         assertEquals(observation.getInt("drawingBufferWidth"), q.getInt("width"))
         assertEquals(observation.getInt("drawingBufferHeight"), q.getInt("height"))
@@ -202,6 +199,36 @@ object ViewerQualityNativeQa {
         waitFor(webView, "the requested high-quality setting") {
             "var s=ModelViewer.getState(),q=s.quality,p=ModelViewer.renderProbe(33);" +
                 "return JSON.stringify({ok:q&&q.ready&&q.enabled===$enabled&&p.ready&&p.glError===0,state:s,probe:p});"
+        }
+    }
+
+    /** Bind readiness and driver dimensions to one observation, then require the
+     * same coherent geometry in two of the existing 100 ms polls. Real layout
+     * changes may legitimately invalidate an earlier, already-rendered size. */
+    private fun waitForSizedDriver(webView: WebView, description: String, high: Boolean,
+                                   geometryCondition: String): JSONObject {
+        val proofKey = JSONObject.quote(System.nanoTime().toString())
+        return waitFor(webView, description) {
+            """
+            var s=ModelViewer.getState(),observation=ViewerQualityQa.snapshot(),q=observation.quality;
+            var stage=document.getElementById('viewer-stage'),box=stage.getBoundingClientRect();
+            var coherent=!!(q&&q.ready&&q.enabled===$high&&s.quality.ready&&s.quality.enabled===$high&&
+              q.cssWidth===stage.clientWidth&&q.cssHeight===stage.clientHeight&&
+              q.width===observation.canvasWidth&&q.height===observation.canvasHeight&&
+              q.width===observation.drawingBufferWidth&&q.height===observation.drawingBufferHeight&&
+              q.width===s.quality.width&&q.height===s.quality.height&&
+              q.nativePixelRatio===observation.nativePixelRatio&&($geometryCondition));
+            var geometry=JSON.stringify(q?{cssWidth:q.cssWidth,cssHeight:q.cssHeight,width:q.width,height:q.height,
+              canvasWidth:observation.canvasWidth,canvasHeight:observation.canvasHeight,
+              drawingWidth:observation.drawingBufferWidth,drawingHeight:observation.drawingBufferHeight,
+              nativeDpr:observation.nativePixelRatio,effectiveDpr:q.effectivePixelRatio,
+              left:box.left,top:box.top,stageWidth:stage.clientWidth,stageHeight:stage.clientHeight,
+              viewportWidth:innerWidth,viewportHeight:innerHeight}:null);
+            var previous=ViewerQualityQa.sizingProof;
+            var settled=coherent&&previous&&previous.key===$proofKey&&previous.geometry===geometry;
+            ViewerQualityQa.sizingProof={key:$proofKey,geometry:coherent?geometry:null};
+            return JSON.stringify({ok:!!settled,state:s,driver:observation,geometry:JSON.parse(geometry)});
+            """.trimIndent()
         }
     }
 

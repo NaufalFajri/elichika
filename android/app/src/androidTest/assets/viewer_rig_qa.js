@@ -69,9 +69,15 @@
     var error = gl.getError();
     if (error !== 0) throw new Error("Actual framebuffer read error " + error);
     var background = (width + 1) * 4, foreground = 0, hash = 2166136261;
+    var foregroundMinimumY = height, foregroundMaximumY = -1;
     for (var offset = 0; offset < pixels.length; offset += 4) {
       if (Math.abs(pixels[offset] - pixels[background]) + Math.abs(pixels[offset + 1] - pixels[background + 1]) +
-          Math.abs(pixels[offset + 2] - pixels[background + 2]) > 24) foreground += 1;
+          Math.abs(pixels[offset + 2] - pixels[background + 2]) > 24) {
+        foreground += 1;
+        var foregroundY = Math.floor(offset / (width * 4));
+        foregroundMinimumY = Math.min(foregroundMinimumY, foregroundY);
+        foregroundMaximumY = Math.max(foregroundMaximumY, foregroundY);
+      }
       hash = Math.imul(hash ^ pixels[offset], 16777619);
       hash = Math.imul(hash ^ pixels[offset + 1], 16777619);
       hash = Math.imul(hash ^ pixels[offset + 2], 16777619);
@@ -94,7 +100,7 @@
     }
     var center = (Math.floor(height / 2) * width + Math.floor(width / 2)) * 4;
     var result = { probe: probe, width: width, height: height, bytesRead: bytes, readPixelsCalls: 1,
-      foregroundPixels: foreground, pixelHash: (hash >>> 0).toString(16),
+      foregroundPixels: foreground, foregroundPixelHeight: foreground ? foregroundMaximumY - foregroundMinimumY + 1 : 0, pixelHash: (hash >>> 0).toString(16),
       centerRGB: [pixels[center], pixels[center + 1], pixels[center + 2]], glError: error,
       camera: current.camera, difference: compared };
     if (saveAs) frames[saveAs] = { pixels: pixels, width: width, height: height,
