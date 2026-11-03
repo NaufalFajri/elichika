@@ -14,7 +14,9 @@ import android.view.View
 import android.view.KeyEvent
 import android.view.WindowManager
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.webkit.WebView
+import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.google.android.material.tabs.TabLayout
@@ -612,6 +614,7 @@ class ModelViewerRigTest {
                 .put("webViewAttached", session.webView.isAttachedToWindow && session.webView.visibility == View.VISIBLE)
                 .put("hasFocus", activity.hasWindowFocus()).put("focusIdentity", System.identityHashCode(activity.currentFocus))
                 .put("orientation", activity.resources.configuration.orientation)
+                .put("requestedOrientation", activity.requestedOrientation)
                 .put("systemUiVisibility", activity.window.decorView.systemUiVisibility).put("windowFlags", activity.window.attributes.flags))
         }
         return result.get()
@@ -914,8 +917,80 @@ class ModelViewerRigTest {
     private fun saveScreenshot(activity: MainActivity, filename: String) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         instrumentation.waitForIdleSync()
-        Thread.sleep(200)
-        instrumentation.runOnMainSync { assertTrue(activity.hasWindowFocus()) }
+        val frameReady = CountDownLatch(1)
+        val observed = AtomicReference<JSONObject>()
+        var captureOrientation = Configuration.ORIENTATION_UNDEFINED
+        lateinit var observer: ViewTreeObserver
+        lateinit var preDraw: ViewTreeObserver.OnPreDrawListener
+        lateinit var focusChange: ViewTreeObserver.OnWindowFocusChangeListener
+        fun observe(): JSONObject {
+            val decor = activity.window.decorView
+            return JSONObject().put("filename", filename).put("activityIdentity", System.identityHashCode(activity))
+                .put("lifecycle", activity.lifecycle.currentState.toString())
+                .put("resumed", activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+                .put("finishing", activity.isFinishing).put("destroyed", activity.isDestroyed)
+                .put("hasFocus", activity.hasWindowFocus()).put("decorAttached", decor.isAttachedToWindow)
+                .put("decorShown", decor.isShown).put("decorVisibility", decor.visibility)
+                .put("decorWidth", decor.width).put("decorHeight", decor.height)
+                .put("orientation", activity.resources.configuration.orientation)
+                .put("requestedOrientation", activity.requestedOrientation)
+                .put("captureOrientation", captureOrientation)
+                .put("focusIdentity", System.identityHashCode(activity.currentFocus))
+                .put("focusClass", activity.currentFocus?.javaClass?.name ?: "none")
+                .put("systemUiVisibility", decor.systemUiVisibility).put("windowFlags", activity.window.attributes.flags)
+        }
+        fun canCapture(state: JSONObject) = state.getBoolean("resumed") && !state.getBoolean("finishing") &&
+            !state.getBoolean("destroyed") && state.getBoolean("hasFocus") && state.getBoolean("decorAttached") &&
+            state.getBoolean("decorShown") && state.getInt("decorWidth") > 0 && state.getInt("decorHeight") > 0 &&
+            state.getInt("orientation") == captureOrientation
+        instrumentation.runOnMainSync {
+            captureOrientation = when (activity.requestedOrientation) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT,
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT, ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT -> Configuration.ORIENTATION_PORTRAIT
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE,
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE, ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE -> Configuration.ORIENTATION_LANDSCAPE
+                else -> activity.resources.configuration.orientation
+            }
+            val decor = activity.window.decorView
+            observer = decor.viewTreeObserver
+            preDraw = ViewTreeObserver.OnPreDrawListener {
+                val current = observe(); observed.set(current)
+                if (canCapture(current)) frameReady.countDown()
+                true
+            }
+            focusChange = ViewTreeObserver.OnWindowFocusChangeListener {
+                observed.set(observe())
+                if (it) decor.postInvalidateOnAnimation()
+            }
+            observer.addOnPreDrawListener(preDraw)
+            observer.addOnWindowFocusChangeListener(focusChange)
+            observed.set(observe())
+            decor.postInvalidateOnAnimation()
+        }
+        try {
+            val ready = frameReady.await(30, TimeUnit.SECONDS)
+            val windowOwner = if (ready) "" else runCatching {
+                android.os.ParcelFileDescriptor.AutoCloseInputStream(
+                    instrumentation.uiAutomation.executeShellCommand("dumpsys window windows")
+                ).bufferedReader().use { reader -> reader.readText().lineSequence()
+                    .filter { it.contains("mCurrentFocus") || it.contains("mFocusedApp") ||
+                        it.contains("mTopFocusedDisplayId") || it.contains("Immersive") || it.contains("immersive") }
+                    .take(30).joinToString("\n") }
+            }.getOrElse { "Window focus diagnostic unavailable: $it" }
+            assertTrue("Timed out awaiting a focused Activity frame for $filename: ${observed.get()}; focused windows: $windowOwner", ready)
+            instrumentation.runOnMainSync {
+                val current = observe(); observed.set(current)
+                assertTrue("Screenshot requires the same resumed, attached Activity: $current", canCapture(current))
+                assertTrue("Screenshot requires focused Activity for $filename: $current", activity.hasWindowFocus())
+            }
+        } finally {
+            instrumentation.runOnMainSync {
+                if (observer.isAlive) {
+                    observer.removeOnPreDrawListener(preDraw)
+                    observer.removeOnWindowFocusChangeListener(focusChange)
+                }
+            }
+        }
         val screenshot = instrumentation.uiAutomation.takeScreenshot()
         assertTrue(screenshot != null)
         File(instrumentation.targetContext.cacheDir, filename).outputStream().use {
