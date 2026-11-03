@@ -13,9 +13,10 @@ import re
 from datetime import datetime
 
 ASSETS_DIR = "assets"
+PATCH_DIR = "scrapped accessory translate"
 DB_JP_DIR = os.path.join(ASSETS_DIR, "db", "jp")
 DB_GL_DIR = os.path.join(ASSETS_DIR, "db", "gl")
-SCRAPED_HTML_PATH = r"C:\Users\LENOVO\Downloads\scrapped accessory translate\Accessories [Nijigasaki High Data Research Club - SIFAS Wiki].htm"
+SCRAPED_HTML_PATH = os.path.join(PATCH_DIR, "Accessories [Nijigasaki High Data Research Club - SIFAS Wiki].htm")
 
 # 44 Accessory translations mapping: (key, ja_name, en_name, ko_name, zh_name)
 ACCESSORY_TRANSLATIONS = {
