@@ -142,7 +142,7 @@ object ViewerQualityNativeQa {
 
     private fun assertDimensions(observation: JSONObject, high: Boolean) {
         val q = observation.getJSONObject("quality")
-        assertTrue("The actual quality pipeline must be ready", q.getBoolean("ready"))
+        assertTrue("The actual quality pipeline must be ready; observation=$observation", q.getBoolean("ready"))
         assertEquals(high, q.getBoolean("enabled"))
         assertEquals(observation.getInt("drawingBufferWidth"), q.getInt("width"))
         assertEquals(observation.getInt("drawingBufferHeight"), q.getInt("height"))
