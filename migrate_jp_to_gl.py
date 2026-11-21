@@ -113,7 +113,9 @@ def migrate_masterdata():
     con_dst = sqlite3.connect(dst_path)
     con_dst.execute(f"ATTACH DATABASE '{os.path.abspath(src_path)}' AS jp_db")
     
-    tables = [r[0] for r in con_dst.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    jp_tables = set(r[0] for r in con_dst.execute("SELECT name FROM jp_db.sqlite_master WHERE type='table'"))
+    gl_tables = set(r[0] for r in con_dst.execute("SELECT name FROM main.sqlite_master WHERE type='table'"))
+    tables = sorted(list(gl_tables & jp_tables))
     total_added = 0
     tables_updated = 0
     
@@ -131,8 +133,13 @@ def migrate_masterdata():
     con_dst.close()
     print(f"    Masterdata migration done: +{total_added} rows across {tables_updated} tables.")
 
-def migrate_asset_dbs():
-    print("\n[*] Migrating Asset Databases (JP -> GL)...")
+def migrate_asset_dbs(backup_dest):
+    print("\n[*] Migrating Asset Databases (Targeted JP -> GL)...")
+    
+    orig_gl_m_path = os.path.abspath(os.path.join(backup_dest, "masterdata.db"))
+    if not os.path.exists(orig_gl_m_path):
+        orig_gl_m_path = os.path.abspath(r"backup\db_gl_20261121_145827\masterdata.db")
+    jp_m_path = os.path.abspath(os.path.join(DB_JP_DIR, "masterdata.db"))
     
     android_targets = [
         os.path.join(DB_GL_DIR, "asset_a_en.db"),
@@ -154,21 +161,112 @@ def migrate_asset_dbs():
             print(f"    Processing {label} DB: {db_name}...")
             con_dst = sqlite3.connect(dst_path)
             con_dst.execute(f"ATTACH DATABASE '{os.path.abspath(src)}' AS jp_asset")
+            con_dst.execute(f"ATTACH DATABASE '{jp_m_path}' AS jp_m")
+            con_dst.execute(f"ATTACH DATABASE '{orig_gl_m_path}' AS orig_gl_m")
             
-            tables = [r[0] for r in con_dst.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-            rows_added = 0
-            for t in tables:
-                before = con_dst.execute(f'SELECT COUNT(*) FROM main."{t}"').fetchone()[0]
-                con_dst.execute(f'INSERT OR IGNORE INTO main."{t}" SELECT * FROM jp_asset."{t}"')
-                after = con_dst.execute(f'SELECT COUNT(*) FROM main."{t}"').fetchone()[0]
-                diff = after - before
-                rows_added += diff
+            # 1. Identify new items
+            con_dst.execute("CREATE TEMP TABLE new_suits AS SELECT id, model_asset_path, thumbnail_image_asset_path FROM jp_m.m_suit WHERE id NOT IN (SELECT id FROM orig_gl_m.m_suit)")
+            con_dst.execute("CREATE TEMP TABLE new_accs AS SELECT id, thumbnail_asset_path FROM jp_m.m_accessory WHERE id NOT IN (SELECT id FROM orig_gl_m.m_accessory)")
+            con_dst.execute("CREATE TEMP TABLE new_lives AS SELECT live_id, jacket_asset_path, bgm_path FROM jp_m.m_live WHERE live_id NOT IN (SELECT live_id FROM orig_gl_m.m_live)")
+            con_dst.execute("CREATE TEMP TABLE new_bgs AS SELECT id, background_asset_path, prefab_asset_path FROM jp_m.m_background WHERE id NOT IN (SELECT id FROM orig_gl_m.m_background)")
             
-            # Recalculate package counts
-            con_dst.execute('UPDATE m_asset_package SET pack_num = (SELECT COUNT(*) FROM m_asset_package_mapping WHERE package_key = m_asset_package.package_key)')
+            # 2. Collect asset paths
+            con_dst.execute("""
+            CREATE TEMP TABLE needed_textures AS
+            SELECT thumbnail_image_asset_path AS asset_path FROM new_suits
+            UNION SELECT thumbnail_asset_path FROM new_accs
+            UNION SELECT jacket_asset_path FROM new_lives
+            UNION SELECT background_asset_path FROM new_bgs WHERE background_asset_path IS NOT NULL
+            UNION SELECT prefab_asset_path FROM new_bgs WHERE prefab_asset_path IS NOT NULL
+            """)
+            con_dst.execute("CREATE TEMP TABLE needed_models AS SELECT model_asset_path AS asset_path FROM new_suits")
+            
+            # 3. Model assets
+            con_dst.execute("INSERT OR IGNORE INTO member_model SELECT * FROM jp_asset.member_model WHERE asset_path IN (SELECT asset_path FROM needed_models)")
+            con_dst.execute("INSERT OR IGNORE INTO member_model_dependency SELECT * FROM jp_asset.member_model_dependency WHERE asset_path IN (SELECT asset_path FROM needed_models)")
+            
+            # 4. Texture assets
+            con_dst.execute("INSERT OR IGNORE INTO texture SELECT * FROM jp_asset.texture WHERE asset_path IN (SELECT asset_path FROM needed_textures)")
+            
+            # 5. Background assets
+            con_dst.execute("INSERT OR IGNORE INTO background SELECT * FROM jp_asset.background WHERE asset_path IN (SELECT asset_path FROM needed_textures)")
+            
+            # 6. Sound assets for music 13001
+            con_dst.execute("INSERT OR IGNORE INTO m_asset_sound SELECT * FROM jp_asset.m_asset_sound WHERE sheet_name = 'music_3001'")
+            
+            # 7. ADV story assets for ES/9901
+            con_dst.execute("INSERT OR IGNORE INTO adv_script SELECT * FROM jp_asset.adv_script")
+            con_dst.execute("INSERT OR IGNORE INTO adv_sound SELECT * FROM jp_asset.adv_sound")
+            con_dst.execute("INSERT OR IGNORE INTO adv_graphic SELECT * FROM jp_asset.adv_graphic")
+            
+            # 8. Pack category
+            con_dst.execute("INSERT OR IGNORE INTO pack_category SELECT * FROM jp_asset.pack_category")
+            
+            # 9. Packages: only genuinely new packages
+            con_dst.execute("""
+            CREATE TEMP TABLE new_packages AS
+            SELECT package_key FROM jp_asset.m_asset_package
+            WHERE package_key NOT IN (SELECT package_key FROM main.m_asset_package)
+            """)
+            
+            con_dst.execute("""
+            INSERT OR IGNORE INTO m_asset_package
+            SELECT * FROM jp_asset.m_asset_package
+            WHERE package_key IN (SELECT package_key FROM new_packages)
+            """)
+            
+            # 10. Package mappings for genuinely new packages
+            con_dst.execute("""
+            INSERT OR IGNORE INTO m_asset_package_mapping
+            SELECT * FROM jp_asset.m_asset_package_mapping
+            WHERE package_key IN (SELECT package_key FROM new_packages)
+            """)
+            
+            # 11. Add missing thumbnail texture packs into 'main' package mapping
+            con_dst.execute("""
+            CREATE TEMP TABLE needed_texture_packs AS
+            SELECT DISTINCT pack_name FROM jp_asset.texture WHERE asset_path IN (SELECT asset_path FROM needed_textures)
+            """)
+            con_dst.execute("""
+            INSERT OR IGNORE INTO m_asset_package_mapping
+            SELECT 'main', pack_name, file_size, NULL, 0, 8
+            FROM jp_asset.m_asset_package_mapping
+            WHERE package_key = 'main' AND pack_name IN (SELECT pack_name FROM needed_texture_packs)
+            AND pack_name NOT IN (SELECT pack_name FROM main.m_asset_package_mapping WHERE package_key = 'main')
+            """)
+            
+            # 12. Register packs into m_asset_pack
+            con_dst.execute("""
+            INSERT OR IGNORE INTO m_asset_pack
+            SELECT DISTINCT pack_name, 0
+            FROM main.m_asset_package_mapping
+            WHERE pack_name NOT IN (SELECT pack_name FROM main.m_asset_pack)
+            """)
+            
+            # 13. Register metapacks
+            con_dst.execute("""
+            INSERT OR IGNORE INTO metapack
+            SELECT * FROM jp_asset.metapack
+            WHERE metapack_name IN (SELECT DISTINCT metapack_name FROM main.m_asset_package_mapping WHERE metapack_name IS NOT NULL)
+            AND metapack_name NOT IN (SELECT metapack_name FROM main.metapack)
+            """)
+            
+            # 14. Update pack_num ONLY for 'main' and new packages
+            con_dst.execute("""
+            UPDATE m_asset_package
+            SET pack_num = (SELECT COUNT(*) FROM m_asset_package_mapping WHERE package_key = m_asset_package.package_key)
+            WHERE package_key = 'main' OR package_key IN (SELECT package_key FROM new_packages)
+            """)
+            
             con_dst.commit()
+            
+            # Quick summary
+            r_main = con_dst.execute("SELECT COUNT(*), SUM(file_size) FROM m_asset_package_mapping WHERE package_key = 'main'").fetchone()
+            tot = con_dst.execute("SELECT COUNT(DISTINCT pack_name), SUM(file_size) FROM m_asset_package_mapping").fetchone()
+            pkgs = con_dst.execute("SELECT COUNT(*) FROM m_asset_package").fetchone()[0]
+            print(f"      -> 'main': {r_main[0]} packs ({r_main[1]/(1024*1024):.1f} MB), pkgs: {pkgs}, total size: {tot[1]/(1024*1024*1024):.2f} GB")
+            
             con_dst.close()
-            print(f"      -> +{rows_added} rows added, pack_num updated.")
 
 def migrate_dictionaries(m_en, m_ko, m_zh):
     print("\n[*] Migrating and Translating Dictionaries...")
@@ -277,7 +375,7 @@ def main():
     print("=" * 65)
     
     # 1. Backup
-    backup_gl_databases()
+    backup_dest = backup_gl_databases()
     
     # 2. Member names
     m_en, m_ko, m_zh = get_member_names()
@@ -286,7 +384,7 @@ def main():
     migrate_masterdata()
     
     # 4. Asset DBs
-    migrate_asset_dbs()
+    migrate_asset_dbs(backup_dest)
     
     # 5. Dictionaries
     migrate_dictionaries(m_en, m_ko, m_zh)
